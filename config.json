@@ -1,0 +1,24 @@
+{
+    "model_name": "RandomForestClassifier",
+    "command_vectorizer_type": "TfidfVectorizer",
+    "response_vectorizer_type": "TfidfVectorizer",
+    "input_fields": [
+        "command",
+        "response",
+        "session_id"
+    ],
+    "feature_pipeline_steps": [
+        {
+            "name": "command_vectorization"
+        },
+        {
+            "name": "response_vectorization"
+        },
+        {
+            "name": "command_length"
+        },
+        {
+            "name": "response_length"
+        }
+    ]
+}
