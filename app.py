@@ -187,6 +187,21 @@ def predict_activity(command: str, response: str) -> dict:
 # ROUTES
 # =========================================================
 
+@app.route("/", methods=["GET"])
+def index():
+    """Root route – returns API info so the root URL is never a 404."""
+    return jsonify({
+        "name": "Honeypot ML Inference API",
+        "version": "1.0.0",
+        "status": "ok" if model_ready else "degraded",
+        "model_loaded": model_ready,
+        "endpoints": {
+            "health":  "GET  /health",
+            "predict": "POST /predict",
+        },
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health_check():
     """Return API and model readiness status."""
