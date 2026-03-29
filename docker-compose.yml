@@ -1,0 +1,27 @@
+# Standalone docker-compose for the ML inference service.
+# Usage:
+#   docker-compose up --build
+#
+# The service will be available at http://localhost:5000
+# - GET  /health   → model status
+# - POST /predict  → classification
+
+services:
+  ml-backend:
+    build: .
+    container_name: honeypot-ml-backend
+    env_file:
+      - .env
+    environment:
+      PORT: "5000"
+      ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:-*}"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "${ML_PORT:-5000}:5000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
