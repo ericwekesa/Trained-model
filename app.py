@@ -23,16 +23,17 @@ Endpoints
   POST /alerts/test     Inject a synthetic alert for testing
 """
 
+from __future__ import annotations
+
 import os
 import json
-import uuid
 import logging
 import time
 import queue
 import threading
 from collections import deque
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 import joblib
 import numpy as np
@@ -98,7 +99,12 @@ def load_artifacts():
             log.warning("label_encoder.pkl absent – using raw class indices")
 
         cfg_path = _artifact("config.json")
-        config = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as _f:
+                _raw = _f.read().strip()
+            config = json.loads(_raw) if _raw else {}
+        else:
+            config = {}
 
         model_ready = True
         load_error = None
@@ -118,7 +124,7 @@ load_artifacts()
 # Each SSE subscriber gets its own queue so alerts are fanned out to every
 # connected browser tab independently.
 _subscriber_lock = threading.Lock()
-_subscribers: list[queue.Queue] = []
+_subscribers: List[queue.Queue] = []
 
 # In-memory ring buffer of recent alerts (latest first)
 _alert_history: deque = deque(maxlen=MAX_ALERTS_HISTORY)
