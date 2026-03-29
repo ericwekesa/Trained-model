@@ -3,9 +3,13 @@ services:
     name: honeypot-ml-backend
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    # gthread worker: 1 process + 8 threads – allows concurrent SSE streams
+    # --timeout 0 prevents gunicorn from killing long-lived SSE connections
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 0 --worker-class gthread
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
       - key: ALLOWED_ORIGINS
         value: "*"
+      - key: MAX_ALERTS_HISTORY
+        value: "200"

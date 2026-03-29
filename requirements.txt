@@ -1,7 +1,7 @@
-flask
-flask-cors
+flask>=3.0.0
+flask-cors>=4.0.0
 scikit-learn
 joblib
 numpy
 scipy
-gunicorn
+gunicorn>=21.2.0
