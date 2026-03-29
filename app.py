@@ -1,29 +1,14 @@
-# Honeypot ML Inference & Alert API – v2.0.0
-"""
-Real-time honeypot threat detection backend.
-
-Architecture decision – Server-Sent Events (SSE) over WebSockets:
-  • SSE is one-directional (server → client), which is exactly what alert
-    streaming requires — the frontend never needs to send data over the
-    stream channel.
-  • SSE reconnects automatically via the browser EventSource API.
-  • SSE works through HTTP/1.1 without protocol upgrade, making it
-    compatible with every reverse proxy and cloud platform (including
-    Render's free tier which kills idle WebSocket connections).
-  • No extra library needed – plain Flask + threading.
-
-Endpoints
-─────────
-  GET  /            API info
-  GET  /health      Liveness + model status
-  POST /predict     One-shot prediction (no alert emitted)
-  POST /event       Ingest a honeypot event → predict → emit alert
-  GET  /alerts/stream   SSE stream (text/event-stream)
-  GET  /alerts/recent   Last N alerts (JSON)
-  POST /alerts/test     Inject a synthetic alert for testing
-"""
-
 from __future__ import annotations
+
+# Honeypot ML Inference API  – v3.0.0
+# Changes from v2:
+#  - /predict now stores every result in an in-memory ring buffer
+#  - /predict now returns correct risk_level (fixes raw 0/1 label bug)
+#  - Added GET  /results          – all stored results, newest first
+#  - Added GET  /results/latest   – single most-recent result
+#  - Added GET  /results/summary  – counts, risk breakdown, latest attack
+#  - Added DELETE /results        – clear all results (demo reset)
+#  - SSE stream event renamed to "result" (was "alert") for consistency
 
 import os
 import json
@@ -41,106 +26,87 @@ from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from scipy.sparse import hstack, csr_matrix
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("honeypot-api")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MAX_ALERTS_HISTORY = int(os.environ.get("MAX_ALERTS_HISTORY", 200))
+# ── App & CORS ────────────────────────────────────────────────────────────────
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", 500))
 
 app = Flask(__name__)
-
 _raw_origins = os.environ.get("ALLOWED_ORIGINS", "*")
 _origins = [o.strip() for o in _raw_origins.split(",")] if _raw_origins != "*" else "*"
 CORS(app, resources={r"/*": {"origins": _origins}})
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ML Artifact state
-# ─────────────────────────────────────────────────────────────────────────────
-rf_model = None
-command_vectorizer = None
+# ── ML state ──────────────────────────────────────────────────────────────────
+rf_model            = None
+command_vectorizer  = None
 response_vectorizer = None
-label_encoder = None
-config: dict = {}
-model_ready = False
+label_encoder       = None
+config: dict        = {}
+model_ready         = False
 load_error: Optional[str] = None
-prediction_count = 0
+prediction_count    = 0
 
 
-def _artifact(filename: str) -> str:
-    return os.path.join(BASE_DIR, filename)
+def _artifact(name: str) -> str:
+    return os.path.join(BASE_DIR, name)
 
 
 def load_artifacts():
     global rf_model, command_vectorizer, response_vectorizer
     global label_encoder, config, model_ready, load_error
-
     try:
-        rf_model = joblib.load(_artifact("rf_model.pkl"))
+        rf_model           = joblib.load(_artifact("rf_model.pkl"))
         command_vectorizer = joblib.load(_artifact("command_vectorizer.pkl"))
 
-        resp_path = _artifact("response_vectorizer.pkl")
-        response_vectorizer = joblib.load(resp_path) if os.path.exists(resp_path) else None
-        if not response_vectorizer:
-            log.warning("response_vectorizer.pkl absent – using zero-padding fallback")
+        rp = _artifact("response_vectorizer.pkl")
+        response_vectorizer = joblib.load(rp) if os.path.exists(rp) else None
 
-        le_path = _artifact("label_encoder.pkl")
-        label_encoder = joblib.load(le_path) if os.path.exists(le_path) else None
-        if not label_encoder:
-            log.warning("label_encoder.pkl absent – using raw class indices")
+        lp = _artifact("label_encoder.pkl")
+        label_encoder = joblib.load(lp) if os.path.exists(lp) else None
 
-        cfg_path = _artifact("config.json")
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r", encoding="utf-8") as _f:
-                _raw = _f.read().strip()
-            config = json.loads(_raw) if _raw else {}
+        cp = _artifact("config.json")
+        if os.path.exists(cp):
+            with open(cp, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            config = json.loads(raw) if raw else {}
         else:
             config = {}
 
         model_ready = True
-        load_error = None
-        log.info("All ML artefacts loaded successfully.")
-
+        load_error  = None
+        log.info("Artefacts loaded. label_encoder=%s", label_encoder is not None)
     except Exception as exc:
         model_ready = False
-        load_error = str(exc)
+        load_error  = str(exc)
         log.error("Artefact load failed: %s", exc)
 
 
 load_artifacts()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# SSE Alert Bus
-# ─────────────────────────────────────────────────────────────────────────────
-# Each SSE subscriber gets its own queue so alerts are fanned out to every
-# connected browser tab independently.
-_subscriber_lock = threading.Lock()
+# ── SSE bus ───────────────────────────────────────────────────────────────────
+_sub_lock: threading.Lock       = threading.Lock()
 _subscribers: List[queue.Queue] = []
-
-# In-memory ring buffer of recent alerts (latest first)
-_alert_history: deque = deque(maxlen=MAX_ALERTS_HISTORY)
-_alert_history_lock = threading.Lock()
+_sse_history: deque             = deque(maxlen=200)
+_sse_history_lock               = threading.Lock()
 
 
-def _register_subscriber() -> queue.Queue:
+def _register_sub() -> queue.Queue:
     q: queue.Queue = queue.Queue(maxsize=100)
-    with _subscriber_lock:
+    with _sub_lock:
         _subscribers.append(q)
-    log.info("SSE subscriber connected  (total=%d)", len(_subscribers))
+    log.info("SSE subscriber connected (total=%d)", len(_subscribers))
     return q
 
 
-def _unregister_subscriber(q: queue.Queue):
-    with _subscriber_lock:
+def _unregister_sub(q: queue.Queue):
+    with _sub_lock:
         try:
             _subscribers.remove(q)
         except ValueError:
@@ -148,115 +114,129 @@ def _unregister_subscriber(q: queue.Queue):
     log.info("SSE subscriber disconnected (total=%d)", len(_subscribers))
 
 
-def _broadcast(alert: dict):
-    """Push alert to all connected SSE subscribers and the history ring."""
-    payload = json.dumps(alert)
-    with _subscriber_lock:
+def _broadcast(payload: dict):
+    data = json.dumps(payload)
+    with _sub_lock:
         dead = []
         for q in _subscribers:
             try:
-                q.put_nowait(payload)
+                q.put_nowait(data)
             except queue.Full:
                 dead.append(q)
-        for q in dead:
-            _subscribers.remove(q)
-    with _alert_history_lock:
-        _alert_history.appendleft(alert)
-    log.info("Alert broadcast: %s  risk=%s  label=%s",
-             alert.get("alert_id"), alert.get("risk_level"), alert.get("predicted_label"))
+        for d in dead:
+            _subscribers.remove(d)
+    with _sse_history_lock:
+        _sse_history.appendleft(payload)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ML Preprocessing
-# ─────────────────────────────────────────────────────────────────────────────
-def preprocess_input(command: str, response: str):
-    cmd_features = command_vectorizer.transform([command])
 
+# ── Result store ──────────────────────────────────────────────────────────────
+_results: deque    = deque(maxlen=MAX_RESULTS)
+_results_lock      = threading.Lock()
+_result_counter    = 0
+_result_counter_lk = threading.Lock()
+
+
+def _next_id() -> int:
+    global _result_counter
+    with _result_counter_lk:
+        _result_counter += 1
+        return _result_counter
+
+
+def _store(record: dict):
+    with _results_lock:
+        _results.appendleft(record)
+
+
+def _all_results() -> list:
+    with _results_lock:
+        return list(_results)
+
+
+def _clear():
+    global _result_counter
+    with _results_lock:
+        _results.clear()
+    with _result_counter_lk:
+        _result_counter = 0
+    with _sse_history_lock:
+        _sse_history.clear()
+    log.info("All results cleared.")
+
+
+# ── ML helpers ────────────────────────────────────────────────────────────────
+def _preprocess(command: str, response: str):
+    cmd_f = command_vectorizer.transform([command])
     if response_vectorizer is not None:
-        resp_features = response_vectorizer.transform([response])
+        resp_f = response_vectorizer.transform([response])
     else:
-        n_expected = rf_model.n_features_in_
-        resp_width = max(0, n_expected - cmd_features.shape[1] - 2)
-        resp_features = csr_matrix((1, resp_width), dtype=np.float32)
-
-    meta_features = csr_matrix(
-        np.array([[len(command), len(response)]], dtype=np.float32)
-    )
-    return hstack([cmd_features, resp_features, meta_features], format="csr")
+        w      = max(0, rf_model.n_features_in_ - cmd_f.shape[1] - 2)
+        resp_f = csr_matrix((1, w), dtype=np.float32)
+    meta_f = csr_matrix(np.array([[len(command), len(response)]], dtype=np.float32))
+    return hstack([cmd_f, resp_f, meta_f], format="csr")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Attack Type Classification (rule-assisted)
-# ─────────────────────────────────────────────────────────────────────────────
-_ATTACK_RULES = [
-    # (pattern_substrings, attack_type, boost_to_critical)
+# When label_encoder is absent the model returns raw class integers.
+# Trained with 0 = benign, 1 = malicious.
+_INT_LABEL = {"0": "benign", "1": "malicious"}
+
+_MALICIOUS_SET = {
+    "malicious", "attack", "1", "malware",
+    "reconnaissance", "exploitation", "lateral_movement",
+}
+
+_ATTACK_RULES: list = [
     (["aws/credentials", "aws_access_key", "aws_secret", ".ssh/id_rsa",
-      "id_dsa", "id_ecdsa", ".netrc", "shadow", "passwd"],
-     "credential_access", True),
-    (["wget", "curl", "python -c", "bash -i", "/dev/tcp", "nc -e",
-      "ncat", "mkfifo", "socat"],
-     "malware_download", True),
-    (["chmod +s", "sudo", "su root", "setuid", "/etc/sudoers",
-      "visudo", "pkexec"],
-     "privilege_escalation", True),
-    (["crontab", "/etc/rc", "systemctl enable", "init.d", ".bashrc",
-      ".profile", "~/.bash_profile", "authorized_keys"],
-     "persistence", False),
-    (["nmap", "masscan", "ping", "traceroute", "arp -a", "netstat",
-      "ss -", "ifconfig", "ip addr", "cat /etc/hosts",
-      "uname -a", "uname -r", "whoami", "id ", "cat /etc/os-release"],
-     "reconnaissance", False),
-    (["ssh ", "scp ", "rsync ", "psexec", "wmic", "net use",
-      "mount ", "rdesktop"],
-     "lateral_movement", True),
-    (["python", "perl", "ruby", "bash ", "sh -c", "exec(",
-      "system(", "eval(", "base64"],
-     "execution", False),
+      "shadow", "passwd", ".netrc"],                       "credential_access",    True),
+    (["wget http", "curl http", "python -c", "bash -i",
+      "/dev/tcp", "nc -e", "mkfifo", "socat"],             "malware_download",     True),
+    (["chmod +x", "./payload", "./exploit", "./shell"],     "execution",            True),
+    (["chmod +s", "sudo", "su root", "setuid",
+      "/etc/sudoers", "pkexec"],                           "privilege_escalation", True),
+    (["crontab", "systemctl enable", "authorized_keys",
+      ".bashrc", ".profile"],                              "persistence",          False),
+    (["whoami", "uname", "ls -l", "id ", "cat /etc",
+      "ifconfig", "ip addr", "netstat", "ps aux", "ls -la"], "reconnaissance",     False),
+    (["ssh ", "scp ", "rsync ", "net use"],                 "lateral_movement",     True),
+    (["python", "perl", "ruby", "bash ", "sh -c",
+      "exec(", "eval(", "base64"],                         "execution",            False),
 ]
 
-def _classify_attack_type(command: str, response: str) -> str:
-    combined = (command + " " + response).lower()
-    for patterns, attack_type, _ in _ATTACK_RULES:
+
+def _attack_type(cmd: str, resp: str) -> str:
+    combined = (cmd + " " + resp).lower()
+    for patterns, atype, _ in _ATTACK_RULES:
         if any(p in combined for p in patterns):
-            return attack_type
+            return atype
     return "other"
 
 
-def _should_escalate_to_critical(command: str, response: str) -> bool:
-    combined = (command + " " + response).lower()
-    for patterns, _, escalate in _ATTACK_RULES:
-        if escalate and any(p in combined for p in patterns):
-            return True
-    return False
+def _is_critical(cmd: str, resp: str) -> bool:
+    combined = (cmd + " " + resp).lower()
+    return any(
+        escalate and any(p in combined for p in patterns)
+        for patterns, _, escalate in _ATTACK_RULES
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Risk level
-# ─────────────────────────────────────────────────────────────────────────────
-_MALICIOUS_LABELS = {"malicious", "attack", "1", "true", "malware",
-                     "reconnaissance", "exploitation", "lateral_movement"}
-
-def _risk_level(label: str, confidence: float,
-                command: str = "", response: str = "") -> str:
-    if label.lower() in _MALICIOUS_LABELS:
-        if _should_escalate_to_critical(command, response):
+def _risk(label: str, conf: float, cmd: str = "", resp: str = "") -> str:
+    if label.lower() in _MALICIOUS_SET:
+        if _is_critical(cmd, resp):
             return "critical"
-        if confidence >= 0.85:
+        if conf >= 0.85:
             return "high"
-        if confidence >= 0.5:
+        if conf >= 0.50:
             return "medium"
         return "low"
     return "low"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Core prediction
-# ─────────────────────────────────────────────────────────────────────────────
-def run_prediction(command: str, response: str) -> dict:
+def _run_prediction(command: str, response: str) -> dict:
     global prediction_count
     if not model_ready:
-        raise RuntimeError(f"Model not ready: {load_error}")
+        raise RuntimeError(load_error or "Model not loaded")
 
-    features = preprocess_input(command, response)
+    features = _preprocess(command, response)
     if features.shape[1] != rf_model.n_features_in_:
         raise ValueError(
             f"Feature mismatch: got {features.shape[1]}, "
@@ -264,96 +244,48 @@ def run_prediction(command: str, response: str) -> dict:
         )
 
     probs = rf_model.predict_proba(features)[0]
-    pred_idx = int(np.argmax(probs))
-    confidence = float(probs[pred_idx])
+    idx   = int(np.argmax(probs))
+    conf  = float(probs[idx])
 
     if label_encoder is not None:
-        predicted_label = str(label_encoder.inverse_transform([pred_idx])[0])
+        raw = str(label_encoder.inverse_transform([idx])[0])
     else:
-        predicted_label = str(rf_model.classes_[pred_idx])
+        raw = str(rf_model.classes_[idx])
 
+    label = _INT_LABEL.get(raw, raw)
     prediction_count += 1
-    return {
-        "predicted_label": predicted_label,
-        "confidence_score": round(confidence, 4),
-    }
+    return {"predicted_label": label, "raw_label": raw, "confidence_score": round(conf, 4)}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Alert builder
-# ─────────────────────────────────────────────────────────────────────────────
-_alert_counter = 0
-_alert_counter_lock = threading.Lock()
-
-def _next_alert_id() -> str:
-    global _alert_counter
-    with _alert_counter_lock:
-        _alert_counter += 1
-        return f"alert-{_alert_counter:06d}"
-
-
-def build_alert(event: dict, prediction: dict) -> dict:
-    command  = event.get("command", "")
-    response = event.get("response", "")
-    label    = prediction["predicted_label"]
-    conf     = prediction["confidence_score"]
-    risk     = _risk_level(label, conf, command, response)
-    atype    = _classify_attack_type(command, response)
-
-    return {
-        "alert_id":         _next_alert_id(),
-        "timestamp":        event.get("timestamp") or datetime.now(timezone.utc).isoformat(),
-        "predicted_label":  label,
-        "confidence_score": conf,
-        "risk_level":       risk,
-        "attack_type":      atype,
-        # location
-        "session_id":       event.get("session_id", ""),
-        "source_ip":        event.get("source_ip", "unknown"),
-        "host":             event.get("host", "unknown"),
-        "container_name":   event.get("container_name", ""),
-        "application_name": event.get("application_name", ""),
-        "endpoint":         event.get("endpoint", ""),
-        "process":          event.get("process", ""),
-        # raw payload
-        "command":          command,
-        "response_snippet": response[:300] if response else "",
-        # meta
-        "acknowledged":     False,
-        "notes":            "",
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Routes
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
-        "name": "Honeypot ML Inference & Alert API",
-        "version": "2.0.0",
-        "status": "ok" if model_ready else "degraded",
+        "name":         "Honeypot ML Inference API",
+        "version":      "3.0.0",
+        "status":       "ok" if model_ready else "degraded",
         "model_loaded": model_ready,
         "endpoints": {
-            "health":         "GET  /health",
-            "predict":        "POST /predict",
-            "event":          "POST /event",
-            "stream":         "GET  /alerts/stream",
-            "recent_alerts":  "GET  /alerts/recent",
-            "test_alert":     "POST /alerts/test",
+            "health":          "GET    /health",
+            "predict":         "POST   /predict",
+            "results":         "GET    /results",
+            "results_latest":  "GET    /results/latest",
+            "results_summary": "GET    /results/summary",
+            "results_clear":   "DELETE /results",
+            "sse_stream":      "GET    /alerts/stream",
         },
     }), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    payload = {
+    return jsonify({
         "status":           "ok" if model_ready else "error",
         "message":          "API is running" if model_ready else (load_error or "Model not loaded"),
         "model_loaded":     model_ready,
         "prediction_count": prediction_count,
-        "alert_count":      len(_alert_history),
+        "result_count":     len(_results),
         "sse_subscribers":  len(_subscribers),
         "artifacts": {
             "rf_model":            rf_model is not None,
@@ -361,28 +293,60 @@ def health():
             "response_vectorizer": response_vectorizer is not None,
             "label_encoder":       label_encoder is not None,
         },
-    }
-    return jsonify(payload), 200 if model_ready else 500
+    }), 200 if model_ready else 500
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /predict  – used by Colab simulation script
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/predict", methods=["POST"])
-def predict_endpoint():
-    """One-shot prediction only – does NOT emit a real-time alert."""
+def predict():
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
-    data = request.get_json(silent=True) or {}
 
-    command    = str(data.get("command", "")).strip()
+    data       = request.get_json(silent=True) or {}
+    command    = str(data.get("command",  "")).strip()
     response   = str(data.get("response", "")).strip()
-    session_id = data.get("session_id", "")
+    session_id = str(data.get("session_id", "")).strip()
 
     if not command:
         return jsonify({"error": "'command' is required"}), 400
 
     try:
-        pred = run_prediction(command, response)
-        pred["session_id"] = session_id
-        return jsonify(pred), 200
+        pred     = _run_prediction(command, response)
+        label    = pred["predicted_label"]
+        conf     = pred["confidence_score"]
+        risk     = _risk(label, conf, command, response)
+        atype    = _attack_type(command, response)
+        detected = label.lower() in _MALICIOUS_SET
+
+        record = {
+            "id":               _next_id(),
+            "timestamp":        datetime.now(timezone.utc).isoformat(),
+            "command":          command,
+            "response":         response[:300],
+            "predicted_label":  label,
+            "raw_label":        pred["raw_label"],
+            "confidence_score": conf,
+            "risk_level":       risk,
+            "attack_type":      atype,
+            "attack_detected":  detected,
+            "session_id":       session_id,
+        }
+
+        _store(record)
+        _broadcast(record)
+
+        return jsonify({
+            "predicted_label":  label,
+            "confidence_score": conf,
+            "risk_level":       risk,
+            "attack_type":      atype,
+            "attack_detected":  detected,
+            "session_id":       session_id,
+            "id":               record["id"],
+        }), 200
+
     except RuntimeError as exc:
         return jsonify({"error": str(exc)}), 503
     except ValueError as exc:
@@ -392,151 +356,112 @@ def predict_endpoint():
         return jsonify({"error": str(exc)}), 500
 
 
-@app.route("/event", methods=["POST"])
-def ingest_event():
-    """
-    Ingest a full honeypot event, run ML prediction, build a structured
-    alert, persist it to history, and broadcast to all SSE subscribers.
-
-    Expected JSON body (all fields except 'command' are optional):
-    {
-      "command":          "cat ~/.aws/credentials",
-      "response":         "[default]\\naws_access_key_id=AKIA...",
-      "session_id":       "sess-001",
-      "source_ip":        "192.168.1.5",
-      "host":             "honeypot-node-1",
-      "container_name":   "web-app-container",
-      "application_name": "node-service",
-      "endpoint":         "/api/upload",
-      "process":          "python3",
-      "timestamp":        "2026-03-30T20:10:00Z"
-    }
-    """
-    if not request.is_json:
-        return jsonify({"error": "Content-Type must be application/json"}), 400
-    event = request.get_json(silent=True) or {}
-
-    command  = str(event.get("command", "")).strip()
-    response = str(event.get("response", "")).strip()
-
-    if not command:
-        return jsonify({"error": "'command' is required"}), 400
-
-    try:
-        prediction = run_prediction(command, response)
-        alert      = build_alert(event, prediction)
-        _broadcast(alert)
-        return jsonify({
-            "status":     "ok",
-            "alert_id":   alert["alert_id"],
-            "alert":      alert,
-        }), 200
-    except RuntimeError as exc:
-        return jsonify({"error": str(exc)}), 503
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-    except Exception as exc:
-        log.exception("Event ingest error")
-        return jsonify({"error": str(exc)}), 500
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /results
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/results", methods=["GET"])
+def get_results():
+    limit = min(int(request.args.get("limit", 100)), MAX_RESULTS)
+    rows  = _all_results()[:limit]
+    return jsonify({"results": rows, "total": len(_results)}), 200
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /results/latest
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/results/latest", methods=["GET"])
+def get_latest():
+    rows = _all_results()
+    return jsonify({"result": rows[0] if rows else None}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /results/summary
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/results/summary", methods=["GET"])
+def get_summary():
+    rows     = _all_results()
+    attacks  = [r for r in rows if r.get("attack_detected")]
+    risk_counts: dict = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+    type_counts: dict = {}
+    for r in rows:
+        lvl = r.get("risk_level", "low")
+        if lvl in risk_counts:
+            risk_counts[lvl] += 1
+        t = r.get("attack_type", "other")
+        type_counts[t] = type_counts.get(t, 0) + 1
+
+    return jsonify({
+        "total_events":   len(rows),
+        "total_attacks":  len(attacks),
+        "benign_events":  len(rows) - len(attacks),
+        "risk_breakdown": risk_counts,
+        "attack_types":   type_counts,
+        "latest_attack":  attacks[0] if attacks else None,
+        "latest_event":   rows[0]    if rows    else None,
+    }), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DELETE /results  – clear all stored results (demo/presentation reset)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/results", methods=["DELETE"])
+def delete_results():
+    _clear()
+    return jsonify({"status": "ok", "message": "All results cleared"}), 200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /alerts/stream  – SSE (kept for backwards compat with SOC dashboard)
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/alerts/stream", methods=["GET"])
 def alert_stream():
-    """
-    Server-Sent Events stream.
-
-    Clients connect with:
-      const es = new EventSource('/alerts/stream');
-      es.onmessage = (e) => { const alert = JSON.parse(e.data); ... };
-
-    The stream emits:
-      • 'connected' event immediately on connection
-      • 'alert'     event for every new alert
-      • comment heartbeat every 25 s to keep the connection alive through
-        proxies that kill idle connections
-    """
-    subscriber_q = _register_subscriber()
+    sub = _register_sub()
 
     def generate():
-        # Immediately confirm connection
         yield "event: connected\ndata: {\"status\":\"connected\"}\n\n"
-
-        last_heartbeat = time.time()
+        last_hb = time.time()
         try:
             while True:
-                # Send heartbeat comment every 25 s
                 now = time.time()
-                if now - last_heartbeat >= 25:
+                if now - last_hb >= 25:
                     yield ": heartbeat\n\n"
-                    last_heartbeat = now
-
+                    last_hb = now
                 try:
-                    payload = subscriber_q.get(timeout=1.0)
+                    payload = sub.get(timeout=1.0)
+                    # emit as both "result" and "alert" for compatibility
+                    yield f"event: result\ndata: {payload}\n\n"
                     yield f"event: alert\ndata: {payload}\n\n"
                 except queue.Empty:
                     pass
-
         except GeneratorExit:
             pass
         finally:
-            _unregister_subscriber(subscriber_q)
+            _unregister_sub(sub)
 
     return Response(
         stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
-            "Cache-Control":    "no-cache",
-            "X-Accel-Buffering": "no",    # Disable nginx buffering
-            "Connection":       "keep-alive",
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
         },
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /alerts/recent  – backwards compat with SOC dashboard
+# ─────────────────────────────────────────────────────────────────────────────
 @app.route("/alerts/recent", methods=["GET"])
-def recent_alerts():
-    """Return the last N alerts. Default N = 50."""
-    limit = min(int(request.args.get("limit", 50)), MAX_ALERTS_HISTORY)
-    with _alert_history_lock:
-        alerts = list(_alert_history)[:limit]
-    return jsonify({"alerts": alerts, "total": len(_alert_history)}), 200
+def alerts_recent():
+    limit = min(int(request.args.get("limit", 50)), 200)
+    with _sse_history_lock:
+        items = list(_sse_history)[:limit]
+    return jsonify({"alerts": items, "total": len(_sse_history)}), 200
 
 
-@app.route("/alerts/test", methods=["POST"])
-def test_alert():
-    """
-    Inject a pre-built synthetic alert for UI testing.
-    Accepts a partial alert dict; missing fields get safe defaults.
-    """
-    data = request.get_json(silent=True) or {}
-    risk = data.get("risk_level", "high")
-    synthetic = {
-        "alert_id":         _next_alert_id(),
-        "timestamp":        datetime.now(timezone.utc).isoformat(),
-        "predicted_label":  data.get("predicted_label", "malicious"),
-        "confidence_score": data.get("confidence_score", 0.95),
-        "risk_level":       risk,
-        "attack_type":      data.get("attack_type", "credential_access"),
-        "session_id":       data.get("session_id", "test-session-001"),
-        "source_ip":        data.get("source_ip", "10.0.0.42"),
-        "host":             data.get("host", "honeypot-test-node"),
-        "container_name":   data.get("container_name", "test-container"),
-        "application_name": data.get("application_name", "test-service"),
-        "endpoint":         data.get("endpoint", "/test"),
-        "process":          data.get("process", "bash"),
-        "command":          data.get("command", "cat ~/.aws/credentials"),
-        "response_snippet": data.get("response_snippet",
-                                     "[default]\naws_access_key_id=AKIATEST123\n"),
-        "acknowledged":     False,
-        "notes":            "Synthetic test alert",
-    }
-    _broadcast(synthetic)
-    return jsonify({"status": "ok", "alert": synthetic}), 200
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Dev entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Dev entry ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    # threaded=True is required for SSE to work in dev mode
     app.run(debug=False, host="0.0.0.0", port=port, threaded=True)
